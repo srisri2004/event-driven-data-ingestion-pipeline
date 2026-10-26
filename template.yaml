@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Event-driven ingestion - API GW -> Kinesis -> DynamoDB -> DDB Streams -> SNS -> SQS
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+
+Resources:
+  # ---------- Streaming + storage ----------
+  EventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # ---------- Fan-out ----------
+  EventsTopic:
+    Type: AWS::SNS::Topic
+
+  AnalyticsDLQ:
+    Type: AWS::SQS::Queue
+  AlertsDLQ:
+    Type: AWS::SQS::Queue
+
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalyticsDLQ.Arn
+        maxReceiveCount: 3
+  AlertsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AlertsDLQ.Arn
+        maxReceiveCount: 3
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref AnalyticsQueue, !Ref AlertsQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: '*'
+            Condition:
+              ArnEquals: { aws:SourceArn: !Ref EventsTopic }
+
+  AnalyticsSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AnalyticsQueue.Arn
+      RawMessageDelivery: true
+
+  AlertsSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AlertsQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy:
+        event_type: [error, payment_failed]
+
+  # ---------- Lambdas ----------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ingest/
+      Handler: app.handler
+      Environment:
+        Variables: { STREAM_NAME: !Ref EventStream }
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: kinesis:PutRecord
+              Resource: !GetAtt EventStream.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties: { Path: /events, Method: POST }
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: processor/
+      Handler: app.handler
+      Environment:
+        Variables: { TABLE_NAME: !Ref EventsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref EventsTable }
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt EventStream.Arn
+            StartingPosition: LATEST
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  PublisherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: publisher/
+      Handler: app.handler
+      Environment:
+        Variables: { TOPIC_ARN: !Ref EventsTopic }
+      Policies:
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt EventsTopic.TopicName }
+      Events:
+        DDB:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt EventsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 50
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  AnalyticsWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: workers/
+      Handler: analytics.handler
+      Events:
+        Q:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AnalyticsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  AlertsWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: workers/
+      Handler: alerts.handler
+      Events:
+        Q:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AlertsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---------- Monitoring ----------
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in a dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt AnalyticsDLQ.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref EventsTopic]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/events'
+  TableName:
+    Value: !Ref EventsTable
