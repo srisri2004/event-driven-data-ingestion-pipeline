@@ -37,3 +37,4 @@ sam delete
 - SNS->SQS fan-out with filter policies decouples consumers; DLQs isolate poison messages.
 - On-demand DynamoDB + TTL keeps cost and storage bounded.
 - Next steps: Firehose -> S3 archive + Athena, X-Ray tracing, API auth (Cognito/API keys), CI/CD with GitHub Actions, load test with Artillery.
+
